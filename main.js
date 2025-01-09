@@ -340,6 +340,26 @@ function parseStates(entities, services, callback) {
                     }
 
                     states.push({id: obj._id, lc, ts, val, ack: true});
+
+if (entity.state === 'on' || entity.state === 'off') {
+    // Define the boolean state object
+    const booleanObj = {
+        _id: `${adapter.namespace}.entities.${entity.entity_id}.state_boolean`,
+        type: 'state',
+        common: {
+            name: `${name} state_BOOLEAN`,
+            type: 'boolean',
+            read: true,
+            write: false
+        },
+        native: {
+            object_id: entity.object_id,
+            domain: entity.domain,
+            entity_id: entity.entity_id
+        }
+    };
+    objs.push(booleanObj);
+}
                 }
             }
         }
@@ -403,6 +423,15 @@ function main() {
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
         if (entity.state !== undefined) {
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
+            // Map the state to a boolean value
+            let booleanState;
+            if (entity.state === 'on') {
+            booleanState = true;
+            } else if (entity.state === 'off') {
+            booleanState = false;
+            }
+            adapter.setState(`${id}state_boolean`, {val: booleanState, ack: true, lc: lc, ts: ts});
+            if (hassObjects[`${adapter.namespace}.${id}state`]) {
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
             } else {
                 adapter.log.info(`State changed for unknown object ${`${id}state`}. Please restart the adapter to resync the objects.`);
@@ -425,7 +454,7 @@ function main() {
                 }
             }
         }
-    });
+    }});
 
     hass.on('connected', () => {
         if (!connected) {
