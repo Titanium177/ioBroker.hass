@@ -434,7 +434,10 @@ function main() {
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
             } else {
-                adapter.log.info(`State changed for unknown object ${`${id}state`}. Please restart the adapter to resync the objects.`);
+            adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
+            syncObjects(Object.values(hassObjects), () => {
+                adapter.log.info('Synchronization completed.');
+            });
             }
         }
         if (entity.attributes) {
@@ -450,7 +453,10 @@ function main() {
                 if (hassObjects[`${adapter.namespace}.${id}state`]) {
                     adapter.setState(id + attrId, {val, ack: true, lc, ts});
                 } else {
-                    adapter.log.info(`State changed for unknown object ${id + attrId}. Please restart the adapter to resync the objects.`);
+                    adapter.log.info(`State changed for unknown object ${id + attrId}. Triggering synchronization to resync the objects.`);
+                    syncObjects(Object.values(hassObjects), () => {
+                        adapter.log.info('Synchronization completed.');
+                    });
                 }
             }
         }
