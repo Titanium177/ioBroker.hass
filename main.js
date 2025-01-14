@@ -277,6 +277,22 @@ function parseStates(entities, services, callback) {
                     entity_id:  entity.entity_id
                 }
             };
+            const booleanObj = {
+                _id: `${adapter.namespace}.entities.${entity.entity_id}.state_boolean`,
+                type: 'state',
+                common: {
+                    name: `${name} state_BOOLEAN`,
+                    type: 'boolean',
+                    read: true,
+                    write: false
+                },
+                native: {
+                    object_id: entity.object_id,
+                    domain: entity.domain,
+                    entity_id: entity.entity_id
+                }
+            };
+            objs.push(booleanObj);
             if (entity.attributes && entity.attributes.unit_of_measurement) {
                 obj.common.unit = entity.attributes.unit_of_measurement;
             }
@@ -340,26 +356,6 @@ function parseStates(entities, services, callback) {
                     }
 
                     states.push({id: obj._id, lc, ts, val, ack: true});
-
-if (entity.state === 'on' || entity.state === 'off') {
-    // Define the boolean state object
-    const booleanObj = {
-        _id: `${adapter.namespace}.entities.${entity.entity_id}.state_boolean`,
-        type: 'state',
-        common: {
-            name: `${name} state_BOOLEAN`,
-            type: 'boolean',
-            read: true,
-            write: false
-        },
-        native: {
-            object_id: entity.object_id,
-            domain: entity.domain,
-            entity_id: entity.entity_id
-        }
-    };
-    objs.push(booleanObj);
-}
                 }
             }
         }
