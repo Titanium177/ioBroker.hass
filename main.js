@@ -14,6 +14,33 @@ let adapter;
 const hassObjects = {};
 let delayTimeout = null;
 let stopped = false;
+let syncDebounceTimeout = null;
+
+function debouncedSync(callback) {
+    if (syncDebounceTimeout) {
+        clearTimeout(syncDebounceTimeout);
+    }
+    syncDebounceTimeout = setTimeout(() => {
+        syncDebounceTimeout = null;
+        hass.getStates((err, states) => {
+            if (err) {
+                adapter.log.error(`Cannot read states during resync: ${err}`);
+                return;
+            }
+            hass.getServices((err, services) => {
+                if (err) {
+                    adapter.log.error(`Cannot read services during resync: ${err}`);
+                    return;
+                }
+                // Parse die States neu und erstelle die Objekte
+                parseStates(states, services, () => {
+                    adapter.log.info('Synchronization completed.');
+                    callback && callback();
+                });
+            });
+        });
+    }, 5000);
+}
 
 function startAdapter(options) {
     options = options || {};
@@ -430,10 +457,8 @@ function main() {
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
             } else {
-            adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
-            syncObjects(Object.values(hassObjects), () => {
-                adapter.log.info('Synchronization completed.');
-            });
+                adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
+                debouncedSync();
             }
         }
         if (entity.attributes) {
@@ -450,9 +475,7 @@ function main() {
                     adapter.setState(id + attrId, {val, ack: true, lc, ts});
                 } else {
                     adapter.log.info(`State changed for unknown object ${id + attrId}. Triggering synchronization to resync the objects.`);
-                    syncObjects(Object.values(hassObjects), () => {
-                        adapter.log.info('Synchronization completed.');
-                    });
+                    debouncedSync();
                 }
             }
         }
