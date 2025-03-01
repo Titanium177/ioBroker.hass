@@ -50,10 +50,6 @@ function startAdapter(options) {
             if (!connected) {
                 return adapter.log.warn(`Cannot send command to "${id}", because not connected`);
             }
-            /*if (id === adapter.namespace + '.' + '.info.resync') {
-                queue.push({command: 'resync'});
-                processQueue();
-            } else */
             if (hassObjects[id]) {
                 if (!hassObjects[id].common.write) {
                     adapter.log.warn(`Object ${id} is not writable!`);
@@ -61,6 +57,34 @@ function startAdapter(options) {
                     const serviceData = {};
                     const fields = hassObjects[id].native.fields;
                     const target = {};
+
+                    if (id.endsWith('.state_boolean')) {
+                        adapter.log.debug(`Object native properties: ${JSON.stringify(hassObjects[id].native)}`);
+                        
+                        const entityId = hassObjects[id].native.entity_id;
+                        const domain = entityId ? entityId.split('.')[0] : (hassObjects[id].native.domain || hassObjects[id].native.type);
+                        const service = state.val ? 'turn_on' : 'turn_off';
+                        
+                        adapter.log.debug(`Processing boolean state change for ${id}`);
+                        adapter.log.debug(`Domain: ${domain}, Entity: ${hassObjects[id].native.entity_id}, Service: ${service}, Value: ${state.val}`);
+                        
+                        if (domain) {
+                            const serviceData = { entity_id: hassObjects[id].native.entity_id };
+                            adapter.log.debug(`Calling HASS with service: ${service}, domain: ${domain}, serviceData: ${JSON.stringify(serviceData)}`);
+                            
+                            hass.callService(service, domain, serviceData, {}, err => {
+                                if (err) {
+                                    adapter.log.error(`Cannot control ${id}: ${err}`);
+                                    adapter.log.debug(`Failed service call details - Service: ${service}, Domain: ${domain}, ServiceData: ${JSON.stringify(serviceData)}`);
+                                } else {
+                                    adapter.log.debug(`Successfully sent command to HASS for ${id}`);
+                                }
+                            });
+                            return;
+                        } else {
+                            adapter.log.warn(`No domain found for ${id}`);
+                        }
+                    }
 
                     let requestFields = {};
                     if (typeof state.val === 'string') {
@@ -360,12 +384,14 @@ function parseStates(entities, services, callback) {
                         name: `${name} STATE_BOOLEAN`,
                         type: 'boolean',
                         read: true,
-                        write: false
+                        write: true
                     },
                     native: {
                         object_id: entity.object_id,
                         domain: entity.domain,
-                        entity_id: entity.entity_id
+                        entity_id: entity.entity_id,
+                        attr: 'state',
+                        type: entity.domain
                     }
                 };
                 objs.push(booleanObj);
