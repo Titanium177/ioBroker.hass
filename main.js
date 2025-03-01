@@ -32,14 +32,10 @@ function debouncedSync(callback) {
                     adapter.log.error(`Cannot read services during resync: ${err}`);
                     return;
                 }
-                // Parse die States neu und erstelle die Objekte
-                parseStates(states, services, () => {
-                    adapter.log.info('Synchronization completed.');
-                    callback && callback();
-                });
+                parseStates(states, services, callback);
             });
         });
-    }, 5000);
+    }, 3000);
 }
 
 function startAdapter(options) {
@@ -163,39 +159,79 @@ function syncStates(states, cb) {
     });
 }
 
-function syncObjects(objects, cb) {
+function syncObjects(objects, stats, cb) {
     if (!objects || !objects.length) {
         return cb();
     }
-    const obj = objects.shift();
-    hassObjects[obj._id] = obj;
 
-    adapter.getForeignObject(obj._id, (err, oldObj) => {
-
-        err && adapter.log.error(err);
-
-        if (!oldObj) {
-            adapter.log.debug(`Create "${obj._id}": ${JSON.stringify(obj.common)}`);
-            hassObjects[obj._id] = obj;
-            adapter.setForeignObject(obj._id, obj, err => {
-                err && adapter.log.error(err);
-                setImmediate(syncObjects, objects, cb);
-            });
-        } else {
-            hassObjects[obj._id] = oldObj;
-            if (JSON.stringify(obj.native) !== JSON.stringify(oldObj.native)) {
-                oldObj.native = obj.native;
-
-                adapter.log.debug(`Update "${obj._id}": ${JSON.stringify(obj.common)}`);
-                adapter.setForeignObject(obj._id, oldObj, err => {
-                    err => adapter.log.error(err);
-                    setImmediate(syncObjects, objects, cb);
-                });
+    const groupedObjects = {};
+    // Zähle zuerst alle neuen Objekte
+    objects.forEach(obj => {
+        const parts = obj._id.split('.');
+        const entityIndex = parts.indexOf('entities') + 1;
+        if (entityIndex > 0 && entityIndex + 1 < parts.length) {
+            const entityId = parts[entityIndex] + '.' + parts[entityIndex + 1];
+            const fullEntityPath = `${adapter.namespace}.entities.${entityId}`;
+            if (!groupedObjects[fullEntityPath]) {
+                groupedObjects[fullEntityPath] = {
+                    new: [],
+                    updated: []
+                };
+            }
+            if (!hassObjects[obj._id]) {
+                groupedObjects[fullEntityPath].new.push(obj);
+                stats.new++; // Zähle neue Objekte direkt
             } else {
-                setImmediate(syncObjects, objects, cb);
+                groupedObjects[fullEntityPath].updated.push(obj);
             }
         }
     });
+
+    const entityIds = Object.keys(groupedObjects);
+
+    function processEntity() {
+        if (!entityIds.length) {
+            return cb();
+        }
+        const entityId = entityIds.shift();
+        const entityObjects = groupedObjects[entityId];
+
+        function processNext() {
+            if (!entityObjects.new.length && !entityObjects.updated.length) {
+                setImmediate(processEntity);
+                return;
+            }
+
+            const obj = entityObjects.new.length ? entityObjects.new.shift() : entityObjects.updated.shift();
+            adapter.getForeignObject(obj._id, (err, oldObj) => {
+                err && adapter.log.error(err);
+
+                if (!oldObj) {
+                    adapter.log.debug(`Create "${obj._id}": ${JSON.stringify(obj.common)}`);
+                    hassObjects[obj._id] = obj;
+                    adapter.setForeignObject(obj._id, obj, err => {
+                        err && adapter.log.error(err);
+                        setImmediate(processNext);
+                    });
+                } else {
+                    hassObjects[obj._id] = oldObj;
+                    if (JSON.stringify(obj.native) !== JSON.stringify(oldObj.native)) {
+                        oldObj.native = obj.native;
+                        adapter.log.debug(`Update "${obj._id}": ${JSON.stringify(obj.common)}`);
+                        adapter.setForeignObject(obj._id, oldObj, err => {
+                            err && adapter.log.error(err);
+                            stats.updated++; // Zähle Updates hier
+                            setImmediate(processNext);
+                        });
+                    } else {
+                        setImmediate(processNext);
+                    }
+                }
+            });
+        }
+        processNext();
+    }
+    processEntity();
 }
 
 function syncRoom(room, members, cb) {
@@ -260,19 +296,25 @@ const skipServices = [
 ];
 
 function parseStates(entities, services, callback) {
-    const objs   = [];
+    const objs = [];
     const states = [];
+    const newHassObjects = {};
     let obj;
     let channel;
+    const expectedObjects = new Set();
+
     for (let e = 0; e < entities.length; e++) {
         const entity = entities[e];
         if (!entity) continue;
 
         const name = entity.name || (entity.attributes && entity.attributes.friendly_name ? entity.attributes.friendly_name : entity.entity_id);
-        const desc = entity.attributes && entity.attributes.attribution   ? entity.attributes.attribution   : undefined;
+        const desc = entity.attributes && entity.attributes.attribution ? entity.attributes.attribution : undefined;
 
+        const channelId = `${adapter.namespace}.entities.${entity.entity_id}`;
+        expectedObjects.add(channelId);
+        
         channel = {
-            _id: `${adapter.namespace}.entities.${entity.entity_id}`,
+            _id: channelId,
             common: {
                 name: name
             },
@@ -289,8 +331,13 @@ function parseStates(entities, services, callback) {
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
 
         if (entity.state !== undefined) {
+            const stateId = `${channelId}.state`;
+            const boolStateId = `${channelId}.state_boolean`;
+            expectedObjects.add(stateId);
+            expectedObjects.add(boolStateId);
+
             obj = {
-                _id: `${adapter.namespace}.entities.${entity.entity_id}.state`,
+                _id: stateId,
                 type: 'state',
                 common: {
                     name: `${name} STATE`,
@@ -299,13 +346,13 @@ function parseStates(entities, services, callback) {
                     write: false
                 },
                 native: {
-                    object_id:  entity.object_id,
-                    domain:     entity.domain,
-                    entity_id:  entity.entity_id
+                    object_id: entity.object_id,
+                    domain: entity.domain,
+                    entity_id: entity.entity_id
                 }
             };
             const booleanObj = {
-                _id: `${adapter.namespace}.entities.${entity.entity_id}.state_boolean`,
+                _id: boolStateId,
                 type: 'state',
                 common: {
                     name: `${name} state_BOOLEAN`,
@@ -323,7 +370,6 @@ function parseStates(entities, services, callback) {
             if (entity.attributes && entity.attributes.unit_of_measurement) {
                 obj.common.unit = entity.attributes.unit_of_measurement;
             }
-            adapter.log.debug(`Found Entity state ${obj._id}: ${JSON.stringify(obj.common)} / ${JSON.stringify(obj.native)}`)
             objs.push(obj);
 
             let val = entity.state;
@@ -331,59 +377,66 @@ function parseStates(entities, services, callback) {
                 val = JSON.stringify(val);
             }
 
-            states.push({id: obj._id, lc, ts, val, ack: true})
+            // Setze state und state_boolean
+            states.push({id: obj._id, lc, ts, val, ack: true});
+            let booleanState = null;
+            if (entity.state === 'on') {
+                booleanState = true;
+            } else if (entity.state === 'off') {
+                booleanState = false;
+            }
+            states.push({id: booleanObj._id, lc, ts, val: booleanState, ack: true});
         }
 
         if (entity.attributes) {
             for (const attr in entity.attributes) {
-                if (entity.attributes.hasOwnProperty(attr)) {
-                    if (attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon') {
-                        continue;
-                    }
-
-                    let common;
-                    if (knownAttributes[attr]) {
-                        common = Object.assign({}, knownAttributes[attr]);
-                    } else {
-                        common = {};
-                    }
-
-                    const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
-                    obj = {
-                        _id: `${adapter.namespace}.entities.${entity.entity_id}.${attrId}`,
-                        type: 'state',
-                        common: common,
-                        native: {
-                            object_id:  entity.object_id,
-                            domain:     entity.domain,
-                            entity_id:  entity.entity_id,
-                            attr:       attr
-                        }
-                    };
-                    if (!common.name) {
-                        common.name = `${name} ${attr.replace(/_/g, ' ')}`;
-                    }
-                    if (common.read === undefined) {
-                        common.read = true;
-                    }
-                    if (common.write === undefined) {
-                        common.write = false;
-                    }
-                    if (common.type === undefined) {
-                        common.type = mapTypes[typeof entity.attributes[attr]];
-                    }
-
-                    adapter.log.debug(`Found Entity attribute ${obj._id}: ${JSON.stringify(obj.common)} / ${JSON.stringify(obj.native)}`)
-
-                    objs.push(obj);
-
-                    let val = entity.attributes[attr];
-                    if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
-                        val = JSON.stringify(val);
-                    }
-
-                    states.push({id: obj._id, lc, ts, val, ack: true});
+                if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon' || !attr.length) {
+                    continue;
                 }
+
+                const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
+                const fullAttrId = `${channelId}.${attrId}`;
+                expectedObjects.add(fullAttrId);
+
+                let common;
+                if (knownAttributes[attr]) {
+                    common = Object.assign({}, knownAttributes[attr]);
+                } else {
+                    common = {};
+                }
+
+                obj = {
+                    _id: fullAttrId,
+                    type: 'state',
+                    common: common,
+                    native: {
+                        object_id: entity.object_id,
+                        domain: entity.domain,
+                        entity_id: entity.entity_id,
+                        attr: attr
+                    }
+                };
+                if (!common.name) {
+                    common.name = `${name} ${attr.replace(/_/g, ' ')}`;
+                }
+                if (common.read === undefined) {
+                    common.read = true;
+                }
+                if (common.write === undefined) {
+                    common.write = false;
+                }
+                if (common.type === undefined) {
+                    common.type = mapTypes[typeof entity.attributes[attr]];
+                }
+
+                objs.push(obj);
+
+                let val = entity.attributes[attr];
+                if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
+                    val = JSON.stringify(val);
+                }
+
+                states.push({id: obj._id, lc, ts, val, ack: true});
             }
         }
 
@@ -393,8 +446,11 @@ function parseStates(entities, services, callback) {
             const service = services[serviceType];
             for (const s in service) {
                 if (service.hasOwnProperty(s)) {
+                    const serviceId = `${channelId}.${s}`;
+                    expectedObjects.add(serviceId);
+                    
                     obj = {
-                        _id: `${adapter.namespace}.entities.${entity.entity_id}.${s}`,
+                        _id: serviceId,
                         type: 'state',
                         common: {
                             desc: service[s].description,
@@ -403,25 +459,103 @@ function parseStates(entities, services, callback) {
                             type: 'mixed'
                         },
                         native: {
-                            object_id:  entity.object_id,
-                            domain:     entity.domain,
-                            fields:     service[s].fields,
-                            entity_id:  entity.entity_id,
-                            attr:       s,
-                            type:       serviceType
+                            object_id: entity.object_id,
+                            domain: entity.domain,
+                            fields: service[s].fields,
+                            entity_id: entity.entity_id,
+                            attr: s,
+                            type: serviceType
                         }
                     };
-
-                    adapter.log.debug(`Found Entity service ${obj._id}: ${JSON.stringify(obj.common)} / ${JSON.stringify(obj.native)}`)
-
                     objs.push(obj);
                 }
             }
         }
     }
 
-    syncObjects(objs, () =>
-        syncStates(states, callback));
+    const objectsToDelete = [];
+    for (const id in hassObjects) {
+        if (hassObjects.hasOwnProperty(id) && id.startsWith(`${adapter.namespace}.entities.`)) {
+            if (!expectedObjects.has(id)) {
+                objectsToDelete.push(id);
+            }
+        }
+    }
+
+    function deleteObjects(objects, cb) {
+        if (!objects.length) {
+            return cb();
+        }
+
+        const groupedObjects = {};
+        objects.forEach(id => {
+            const parts = id.split('.');
+            const entityIndex = parts.indexOf('entities') + 1;
+            if (entityIndex > 0 && entityIndex + 1 < parts.length) {
+                const entityId = parts[entityIndex] + '.' + parts[entityIndex + 1];
+                const fullEntityPath = `${adapter.namespace}.entities.${entityId}`;
+                if (!groupedObjects[fullEntityPath]) {
+                    groupedObjects[fullEntityPath] = [];
+                }
+                groupedObjects[fullEntityPath].push(id);
+            }
+        });
+
+        const entityIds = Object.keys(groupedObjects);
+        
+        function deleteEntity() {
+            if (!entityIds.length) {
+                return cb();
+            }
+            const entityId = entityIds.shift();
+            const objectsToDelete = groupedObjects[entityId];
+            
+            let deleted = 0;
+            function deleteNext() {
+                if (!objectsToDelete.length) {
+                    if (deleted > 0) {
+                        // Entferne die einzelnen Löschmeldungen
+                        deleted++;
+                    }
+                    setImmediate(deleteEntity);
+                    return;
+                }
+                const id = objectsToDelete.shift();
+                adapter.delObject(id, err => {
+                    if (err) {
+                        adapter.log.error(`Error deleting object ${id}: ${err}`);
+                    } else {
+                        deleted++;
+                        delete hassObjects[id];
+                    }
+                    setImmediate(deleteNext);
+                });
+            }
+            deleteNext();
+        }
+        deleteEntity();
+    }
+
+    const stats = {
+        new: 0,
+        updated: 0,
+        deleted: objectsToDelete.length
+    };
+
+    deleteObjects(objectsToDelete, () => {
+        syncObjects(objs, stats, () => {
+            // Gebe nur eine Zusammenfassung aus, wenn es Änderungen gab
+            if (stats.new > 0 || stats.deleted > 0) {
+                const changes = [];
+                if (stats.new > 0) changes.push(`${stats.new} created`);
+                if (stats.deleted > 0) changes.push(`${stats.deleted} deleted`);
+                adapter.log.info(`Synchronization completed: ${changes.join(', ')}`);
+            }
+            syncStates(states, () => {
+                callback && callback();
+            });
+        });
+    });
 }
 
 function main() {
@@ -445,16 +579,16 @@ function main() {
         const lc = entity.last_changed ? new Date(entity.last_changed).getTime() : undefined;
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
         if (entity.state !== undefined) {
-            if (hassObjects[`${adapter.namespace}.${id}state`]) {
             // Map the state to a boolean value
-            let booleanState;
+            let booleanState = null;
             if (entity.state === 'on') {
-            booleanState = true;
+                booleanState = true;
             } else if (entity.state === 'off') {
-            booleanState = false;
+                booleanState = false;
             }
-            adapter.setState(`${id}state_boolean`, {val: booleanState, ack: true, lc: lc, ts: ts});
+            
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
+                adapter.setState(`${id}state_boolean`, {val: booleanState, ack: true, lc: lc, ts: ts});
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
             } else {
                 adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
@@ -479,7 +613,7 @@ function main() {
                 }
             }
         }
-    }});
+    });
 
     hass.on('connected', () => {
         if (!connected) {
@@ -491,7 +625,6 @@ function main() {
                     adapter.log.error(`Cannot read config: ${err}`);
                     return;
                 }
-                //adapter.log.debug(JSON.stringify(config));
                 delayTimeout = setTimeout(() => {
                     delayTimeout = null;
                     !stopped && hass.getStates((err, states) => {
@@ -501,7 +634,6 @@ function main() {
                         if (err) {
                             return adapter.log.error(`Cannot read states: ${err}`);
                         }
-                        //adapter.log.debug(JSON.stringify(states));
                         delayTimeout = setTimeout(() => {
                             delayTimeout = null;
                             !stopped && hass.getServices((err, services) => {
@@ -511,9 +643,8 @@ function main() {
                                 if (err) {
                                     adapter.log.error(`Cannot read states: ${err}`);
                                 } else {
-                                    //adapter.log.debug(JSON.stringify(services));
                                     parseStates(states, services, () => {
-                                        adapter.log.debug('Initial parsing of states done, subscribe to ioBroker states');
+                                        adapter.log.info('Initialization completed');
                                         adapter.subscribeStates('*');
                                     });
                                 }
