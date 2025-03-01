@@ -180,7 +180,7 @@ function syncObjects(objects, stats, cb) {
             }
             if (!hassObjects[obj._id]) {
                 groupedObjects[fullEntityPath].new.push(obj);
-                stats.new++; // Zähle neue Objekte direkt
+                stats.new++;
             } else {
                 groupedObjects[fullEntityPath].updated.push(obj);
             }
@@ -332,9 +332,7 @@ function parseStates(entities, services, callback) {
 
         if (entity.state !== undefined) {
             const stateId = `${channelId}.state`;
-            const boolStateId = `${channelId}.state_boolean`;
             expectedObjects.add(stateId);
-            expectedObjects.add(boolStateId);
 
             obj = {
                 _id: stateId,
@@ -351,22 +349,35 @@ function parseStates(entities, services, callback) {
                     entity_id: entity.entity_id
                 }
             };
-            const booleanObj = {
-                _id: boolStateId,
-                type: 'state',
-                common: {
-                    name: `${name} state_BOOLEAN`,
-                    type: 'boolean',
-                    read: true,
-                    write: false
-                },
-                native: {
-                    object_id: entity.object_id,
-                    domain: entity.domain,
-                    entity_id: entity.entity_id
-                }
-            };
-            objs.push(booleanObj);
+
+            if (entity.state === 'on' || entity.state === 'off') {
+                const boolStateId = `${channelId}.state_boolean`;
+                expectedObjects.add(boolStateId);
+                const booleanObj = {
+                    _id: boolStateId,
+                    type: 'state',
+                    common: {
+                        name: `${name} STATE_BOOLEAN`,
+                        type: 'boolean',
+                        read: true,
+                        write: false
+                    },
+                    native: {
+                        object_id: entity.object_id,
+                        domain: entity.domain,
+                        entity_id: entity.entity_id
+                    }
+                };
+                objs.push(booleanObj);
+                states.push({
+                    id: boolStateId,
+                    lc,
+                    ts,
+                    val: entity.state === 'on',
+                    ack: true
+                });
+            }
+
             if (entity.attributes && entity.attributes.unit_of_measurement) {
                 obj.common.unit = entity.attributes.unit_of_measurement;
             }
@@ -376,16 +387,7 @@ function parseStates(entities, services, callback) {
             if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
                 val = JSON.stringify(val);
             }
-
-            // Setze state und state_boolean
             states.push({id: obj._id, lc, ts, val, ack: true});
-            let booleanState = null;
-            if (entity.state === 'on') {
-                booleanState = true;
-            } else if (entity.state === 'off') {
-                booleanState = false;
-            }
-            states.push({id: booleanObj._id, lc, ts, val: booleanState, ack: true});
         }
 
         if (entity.attributes) {
@@ -514,7 +516,6 @@ function parseStates(entities, services, callback) {
             function deleteNext() {
                 if (!objectsToDelete.length) {
                     if (deleted > 0) {
-                        // Entferne die einzelnen Löschmeldungen
                         deleted++;
                     }
                     setImmediate(deleteEntity);
@@ -544,7 +545,6 @@ function parseStates(entities, services, callback) {
 
     deleteObjects(objectsToDelete, () => {
         syncObjects(objs, stats, () => {
-            // Gebe nur eine Zusammenfassung aus, wenn es Änderungen gab
             if (stats.new > 0 || stats.deleted > 0) {
                 const changes = [];
                 if (stats.new > 0) changes.push(`${stats.new} created`);
@@ -579,17 +579,17 @@ function main() {
         const lc = entity.last_changed ? new Date(entity.last_changed).getTime() : undefined;
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
         if (entity.state !== undefined) {
-            // Map the state to a boolean value
-            let booleanState = null;
-            if (entity.state === 'on') {
-                booleanState = true;
-            } else if (entity.state === 'off') {
-                booleanState = false;
-            }
-            
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
-                adapter.setState(`${id}state_boolean`, {val: booleanState, ack: true, lc: lc, ts: ts});
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
+                
+                if (entity.state === 'on' || entity.state === 'off') {
+                    adapter.setState(`${id}state_boolean`, {
+                        val: entity.state === 'on',
+                        ack: true,
+                        lc: lc,
+                        ts: ts
+                    });
+                }
             } else {
                 adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
                 debouncedSync();
