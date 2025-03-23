@@ -319,6 +319,35 @@ const skipServices = [
     'persistent_notification'
 ];
 
+function createMissingState(channelId, attrId, entity, attr, value) {
+    const fullAttrId = `${channelId}.${attrId}`;
+    if (!hassObjects[fullAttrId]) {
+        const obj = {
+            _id: fullAttrId,
+            type: 'state',
+            common: {
+                name: `${entity.name || entity.entity_id} ${attr.replace(/_/g, ' ')}`,
+                type: mapTypes[typeof value],
+                read: true,
+                write: false
+            },
+            native: {
+                object_id: entity.object_id,
+                domain: entity.domain,
+                entity_id: entity.entity_id,
+                attr: attr
+            }
+        };
+        adapter.setObject(fullAttrId, obj, err => {
+            if (err) {
+                adapter.log.error(`Cannot create object ${fullAttrId}: ${err}`);
+            } else {
+                hassObjects[fullAttrId] = obj;
+            }
+        });
+    }
+}
+
 function parseStates(entities, services, callback) {
     const objs = [];
     const states = [];
@@ -425,6 +454,8 @@ function parseStates(entities, services, callback) {
                 const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
                 const fullAttrId = `${channelId}.${attrId}`;
                 expectedObjects.add(fullAttrId);
+
+                createMissingState(channelId, attrId, entity, attr, entity.attributes[attr]);
 
                 let common;
                 if (knownAttributes[attr]) {
@@ -602,11 +633,14 @@ function main() {
         }
 
         const id = `entities.${entity.entity_id}.`;
+        const channelId = `${adapter.namespace}.entities.${entity.entity_id}`;
         const lc = entity.last_changed ? new Date(entity.last_changed).getTime() : undefined;
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
+
         if (entity.state !== undefined) {
-            if (hassObjects[`${adapter.namespace}.${id}state`]) {
-                adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
+            const stateId = `${id}state`;
+            if (hassObjects[`${adapter.namespace}.${stateId}`]) {
+                adapter.setState(stateId, {val: entity.state, ack: true, lc: lc, ts: ts});
                 
                 if (entity.state === 'on' || entity.state === 'off') {
                     adapter.setState(`${id}state_boolean`, {
@@ -617,25 +651,30 @@ function main() {
                     });
                 }
             } else {
-                adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
-                debouncedSync();
+                adapter.log.info(`State changed for unknown object ${stateId}. Creating missing state.`);
+                createMissingState(channelId, 'state', entity, 'state', entity.state);
             }
         }
+
         if (entity.attributes) {
             for (const attr in entity.attributes) {
-                if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon'|| !attr.length) {
+                if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon' || !attr.length) {
                     continue;
                 }
+
+                const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
+                const fullAttrId = `${id}${attrId}`;
                 let val = entity.attributes[attr];
+                
                 if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
                     val = JSON.stringify(val);
                 }
-                const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
-                if (hassObjects[`${adapter.namespace}.${id}state`]) {
-                    adapter.setState(id + attrId, {val, ack: true, lc, ts});
+
+                if (hassObjects[`${adapter.namespace}.${fullAttrId}`]) {
+                    adapter.setState(fullAttrId, {val, ack: true, lc, ts});
                 } else {
-                    adapter.log.info(`State changed for unknown object ${id + attrId}. Triggering synchronization to resync the objects.`);
-                    debouncedSync();
+                    adapter.log.info(`Attribute changed for unknown object ${fullAttrId}. Creating missing state.`);
+                    createMissingState(channelId, attrId, entity, attr, val);
                 }
             }
         }
