@@ -16,6 +16,124 @@ let delayTimeout = null;
 let stopped = false;
 let syncDebounceTimeout = null;
 
+function getRoleForState(entity) {
+    const domain = entity.domain || entity.entity_id.split('.')[0];
+    const state = entity.state;
+    
+    switch(domain) {
+        case 'light':
+            return 'switch';
+        case 'switch':
+            return 'switch';
+        case 'binary_sensor':
+            return 'sensor.binary';
+        case 'sensor':
+            if (typeof state === 'number' || !isNaN(parseFloat(state))) {
+                if (entity.attributes && entity.attributes.unit_of_measurement) {
+                    const unit = entity.attributes.unit_of_measurement;
+                    if (unit === '°C' || unit === '°F' || unit === 'K') {
+                        return 'value.temperature';
+                    } else if (unit === '%') {
+                        return 'value.humidity';
+                    } else if (unit === 'hPa' || unit === 'mbar') {
+                        return 'value.pressure';
+                    } else if (unit === 'W' || unit === 'kW') {
+                        return 'value.power';
+                    } else if (unit === 'V') {
+                        return 'value.voltage';
+                    } else if (unit === 'A') {
+                        return 'value.current';
+                    } else if (unit.indexOf('m/s') !== -1 || unit.indexOf('km/h') !== -1) {
+                        return 'value.speed';
+                    }
+                }
+                return 'value';
+            }
+            return 'text';
+        case 'climate':
+            return 'thermostat';
+        case 'cover':
+            return 'blind';
+        case 'lock':
+            return 'state';
+        case 'input_boolean':
+            return 'switch';
+        case 'input_number':
+            return 'level';
+        case 'input_text':
+            return 'text';
+        case 'input_select':
+            return 'text';
+        case 'media_player':
+            return 'media.state';
+        case 'device_tracker':
+            return 'state';
+        case 'scene':
+            return 'button';
+        case 'script':
+            return 'button';
+        case 'automation':
+            return 'switch';
+        case 'vacuum':
+            return 'state';
+        case 'weather':
+            return 'weather';
+        default:
+            if (state === 'on' || state === 'off') {
+                return 'switch';
+            } else if (typeof state === 'number' || !isNaN(parseFloat(state))) {
+                return 'value';
+            } else if (typeof state === 'boolean') {
+                return 'indicator';
+            }
+            return 'state';
+    }
+}
+
+function getRoleForAttribute(attr, value, type) {
+    const attrLower = attr.toLowerCase(); 
+    if (attrLower.includes('temperature')) {
+        return 'value.temperature';
+    } else if (attrLower.includes('humidity')) {
+        return 'value.humidity';
+    } else if (attrLower.includes('pressure')) {
+        return 'value.pressure';
+    } else if (attrLower === 'brightness' || attrLower === 'current_position') {
+        return 'level.dimmer';
+    } else if (attrLower === 'rgb_color' || attrLower === 'xy_color') {
+        return 'level.color.rgb';
+    } else if (attrLower === 'color_temp') {
+        return 'level.color.temperature';
+    } else if (attrLower === 'battery_level' || attrLower === 'battery') {
+        return 'value.battery';
+    } else if (attrLower === 'locked') {
+        return 'indicator';
+    } else if (attrLower === 'volume_level') {
+        return 'level.volume';
+    } else if (attrLower === 'position') {
+        return 'level';
+    } else if (attrLower === 'speed' || attrLower === 'percentage') {
+        return 'level';
+    } else if (attrLower === 'mode' || attrLower === 'preset_mode') {
+        return 'text';
+    }
+    
+    switch(type) {
+        case 'number':
+            return 'value';
+        case 'boolean':
+            return 'indicator';
+        case 'string':
+            return 'text';
+        case 'object':
+        case 'mixed':
+        case 'array':
+            return 'json';
+        default:
+            return 'state';
+    }
+}
+
 function debouncedSync(callback) {
     if (syncDebounceTimeout) {
         clearTimeout(syncDebounceTimeout);
@@ -319,35 +437,6 @@ const skipServices = [
     'persistent_notification'
 ];
 
-function createMissingState(channelId, attrId, entity, attr, value) {
-    const fullAttrId = `${channelId}.${attrId}`;
-    if (!hassObjects[fullAttrId]) {
-        const obj = {
-            _id: fullAttrId,
-            type: 'state',
-            common: {
-                name: `${entity.name || entity.entity_id} ${attr.replace(/_/g, ' ')}`,
-                type: mapTypes[typeof value],
-                read: true,
-                write: false
-            },
-            native: {
-                object_id: entity.object_id,
-                domain: entity.domain,
-                entity_id: entity.entity_id,
-                attr: attr
-            }
-        };
-        adapter.setObject(fullAttrId, obj, err => {
-            if (err) {
-                adapter.log.error(`Cannot create object ${fullAttrId}: ${err}`);
-            } else {
-                hassObjects[fullAttrId] = obj;
-            }
-        });
-    }
-}
-
 function parseStates(entities, services, callback) {
     const objs = [];
     const states = [];
@@ -369,7 +458,8 @@ function parseStates(entities, services, callback) {
         channel = {
             _id: channelId,
             common: {
-                name: name
+                name: name,
+                role: 'channel'
             },
             type: 'channel',
             native: {
@@ -394,7 +484,8 @@ function parseStates(entities, services, callback) {
                     name: `${name} STATE`,
                     type: typeof entity.state,
                     read: true,
-                    write: false
+                    write: false,
+                    role: getRoleForState(entity)
                 },
                 native: {
                     object_id: entity.object_id,
@@ -413,7 +504,8 @@ function parseStates(entities, services, callback) {
                         name: `${name} STATE_BOOLEAN`,
                         type: 'boolean',
                         read: true,
-                        write: true
+                        write: true,
+                        role: 'switch'
                     },
                     native: {
                         object_id: entity.object_id,
@@ -455,8 +547,6 @@ function parseStates(entities, services, callback) {
                 const fullAttrId = `${channelId}.${attrId}`;
                 expectedObjects.add(fullAttrId);
 
-                createMissingState(channelId, attrId, entity, attr, entity.attributes[attr]);
-
                 let common;
                 if (knownAttributes[attr]) {
                     common = Object.assign({}, knownAttributes[attr]);
@@ -487,6 +577,9 @@ function parseStates(entities, services, callback) {
                 if (common.type === undefined) {
                     common.type = mapTypes[typeof entity.attributes[attr]];
                 }
+                if (common.role === undefined) {
+                    common.role = getRoleForAttribute(attr, entity.attributes[attr], common.type);
+                }
 
                 objs.push(obj);
 
@@ -515,7 +608,8 @@ function parseStates(entities, services, callback) {
                             desc: service[s].description,
                             read: false,
                             write: true,
-                            type: 'mixed'
+                            type: 'mixed',
+                            role: 'button'
                         },
                         native: {
                             object_id: entity.object_id,
@@ -633,14 +727,11 @@ function main() {
         }
 
         const id = `entities.${entity.entity_id}.`;
-        const channelId = `${adapter.namespace}.entities.${entity.entity_id}`;
         const lc = entity.last_changed ? new Date(entity.last_changed).getTime() : undefined;
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
-
         if (entity.state !== undefined) {
-            const stateId = `${id}state`;
-            if (hassObjects[`${adapter.namespace}.${stateId}`]) {
-                adapter.setState(stateId, {val: entity.state, ack: true, lc: lc, ts: ts});
+            if (hassObjects[`${adapter.namespace}.${id}state`]) {
+                adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
                 
                 if (entity.state === 'on' || entity.state === 'off') {
                     adapter.setState(`${id}state_boolean`, {
@@ -651,30 +742,25 @@ function main() {
                     });
                 }
             } else {
-                adapter.log.info(`State changed for unknown object ${stateId}. Creating missing state.`);
-                createMissingState(channelId, 'state', entity, 'state', entity.state);
+                adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
+                debouncedSync();
             }
         }
-
         if (entity.attributes) {
             for (const attr in entity.attributes) {
-                if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon' || !attr.length) {
+                if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon'|| !attr.length) {
                     continue;
                 }
-
-                const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
-                const fullAttrId = `${id}${attrId}`;
                 let val = entity.attributes[attr];
-                
                 if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
                     val = JSON.stringify(val);
                 }
-
-                if (hassObjects[`${adapter.namespace}.${fullAttrId}`]) {
-                    adapter.setState(fullAttrId, {val, ack: true, lc, ts});
+                const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
+                if (hassObjects[`${adapter.namespace}.${id}state`]) {
+                    adapter.setState(id + attrId, {val, ack: true, lc, ts});
                 } else {
-                    adapter.log.info(`Attribute changed for unknown object ${fullAttrId}. Creating missing state.`);
-                    createMissingState(channelId, attrId, entity, attr, val);
+                    adapter.log.info(`State changed for unknown object ${id + attrId}. Triggering synchronization to resync the objects.`);
+                    debouncedSync();
                 }
             }
         }
