@@ -494,9 +494,10 @@ function parseStates(entities, services, callback) {
                 }
             };
 
-            if (entity.state === 'on' || entity.state === 'off') {
-                const boolStateId = `${channelId}.state_boolean`;
-                expectedObjects.add(boolStateId);
+            const boolStateId = `${channelId}.state_boolean`;
+            expectedObjects.add(boolStateId);
+
+            if (!objs.find(o => o._id === boolStateId)) {
                 const booleanObj = {
                     _id: boolStateId,
                     type: 'state',
@@ -518,8 +519,8 @@ function parseStates(entities, services, callback) {
                 objs.push(booleanObj);
                 states.push({
                     id: boolStateId,
-                    lc,
-                    ts,
+                    lc: lc || Date.now(),
+                    ts: ts || Date.now(),
                     val: entity.state === 'on',
                     ack: true
                 });
@@ -732,20 +733,20 @@ function main() {
         if (entity.state !== undefined) {
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
-                
-                if (entity.state === 'on' || entity.state === 'off') {
-                    adapter.setState(`${id}state_boolean`, {
-                        val: entity.state === 'on',
-                        ack: true,
-                        lc: lc,
-                        ts: ts
-                    });
-                }
             } else {
                 adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
                 debouncedSync();
             }
+            if (hassObjects[`${adapter.namespace}.${id}state_boolean`]) {
+                adapter.setState(`${id}state_boolean`, {
+                    val: entity.state === 'on',
+                    ack: true,
+                    lc: lc || Date.now(),
+                    ts: ts || Date.now()
+                });
+            }
         }
+        
         if (entity.attributes) {
             for (const attr in entity.attributes) {
                 if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon'|| !attr.length) {
