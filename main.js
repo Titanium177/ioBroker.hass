@@ -14,6 +14,170 @@ let adapter;
 const hassObjects = {};
 let delayTimeout = null;
 let stopped = false;
+let syncDebounceTimeout = null;
+
+function safeStringify(obj) {
+    try {
+        return JSON.stringify(obj);
+    } catch (e) {
+        try {
+            // fallback to a replacer that avoids circular refs
+            const seen = new WeakSet();
+            return JSON.stringify(obj, (key, value) => {
+                if (typeof value === "object" && value !== null) {
+                    if (seen.has(value)) {
+                        return '[Circular]';
+                    }
+                    seen.add(value);
+                }
+                return value;
+            });
+        } catch (e2) {
+            return String(obj);
+        }
+    }
+}
+
+function getRoleForState(entity) {
+    const domain = entity.domain || entity.entity_id.split('.')[0];
+    const state = entity.state;
+    
+    switch(domain) {
+        case 'light':
+            return 'switch';
+        case 'switch':
+            return 'switch';
+        case 'binary_sensor':
+            return 'sensor.binary';
+        case 'sensor':
+            if (typeof state === 'number' || !isNaN(parseFloat(state))) {
+                if (entity.attributes && entity.attributes.unit_of_measurement) {
+                    const unit = entity.attributes.unit_of_measurement;
+                    if (unit === '°C' || unit === '°F' || unit === 'K') {
+                        return 'value.temperature';
+                    } else if (unit === '%') {
+                        return 'value.humidity';
+                    } else if (unit === 'hPa' || unit === 'mbar') {
+                        return 'value.pressure';
+                    } else if (unit === 'W' || unit === 'kW') {
+                        return 'value.power';
+                    } else if (unit === 'V') {
+                        return 'value.voltage';
+                    } else if (unit === 'A') {
+                        return 'value.current';
+                    } else if ((unit && unit.indexOf && (unit.indexOf('m/s') !== -1 || unit.indexOf('km/h') !== -1))) {
+                        return 'value.speed';
+                    }
+                }
+                return 'value';
+            }
+            return 'text';
+        case 'climate':
+            return 'thermostat';
+        case 'cover':
+            return 'blind';
+        case 'lock':
+            return 'state';
+        case 'input_boolean':
+            return 'switch';
+        case 'input_number':
+            return 'level';
+        case 'input_text':
+            return 'text';
+        case 'input_select':
+            return 'text';
+        case 'media_player':
+            return 'media.state';
+        case 'device_tracker':
+            return 'state';
+        case 'scene':
+            return 'button';
+        case 'script':
+            return 'button';
+        case 'automation':
+            return 'switch';
+        case 'vacuum':
+            return 'state';
+        case 'weather':
+            return 'weather';
+        default:
+            if (state === 'on' || state === 'off') {
+                return 'switch';
+            } else if (typeof state === 'number' || !isNaN(parseFloat(state))) {
+                return 'value';
+            } else if (typeof state === 'boolean') {
+                return 'indicator';
+            }
+            return 'state';
+    }
+}
+
+function getRoleForAttribute(attr, value, type) {
+    const attrLower = attr.toLowerCase(); 
+    if (attrLower.includes('temperature')) {
+        return 'value.temperature';
+    } else if (attrLower.includes('humidity')) {
+        return 'value.humidity';
+    } else if (attrLower.includes('pressure')) {
+        return 'value.pressure';
+    } else if (attrLower === 'brightness' || attrLower === 'current_position') {
+        return 'level.dimmer';
+    } else if (attrLower === 'rgb_color' || attrLower === 'xy_color') {
+        return 'level.color.rgb';
+    } else if (attrLower === 'color_temp') {
+        return 'level.color.temperature';
+    } else if (attrLower === 'battery_level' || attrLower === 'battery') {
+        return 'value.battery';
+    } else if (attrLower === 'locked') {
+        return 'indicator';
+    } else if (attrLower === 'volume_level') {
+        return 'level.volume';
+    } else if (attrLower === 'position') {
+        return 'level';
+    } else if (attrLower === 'speed' || attrLower === 'percentage') {
+        return 'level';
+    } else if (attrLower === 'mode' || attrLower === 'preset_mode') {
+        return 'text';
+    }
+    
+    switch(type) {
+        case 'number':
+            return 'value';
+        case 'boolean':
+            return 'indicator';
+        case 'string':
+            return 'text';
+        case 'object':
+        case 'mixed':
+        case 'array':
+            return 'json';
+        default:
+            return 'state';
+    }
+}
+
+function debouncedSync(callback) {
+    if (syncDebounceTimeout) {
+        clearTimeout(syncDebounceTimeout);
+    }
+    syncDebounceTimeout = setTimeout(() => {
+        syncDebounceTimeout = null;
+        if (!hass || stopped) return;
+        hass.getStates((err, states) => {
+            if (err) {
+                adapter.log.error(`Cannot read states during resync: ${err}`);
+                return;
+            }
+            hass.getServices((err, services) => {
+                if (err) {
+                    adapter.log.error(`Cannot read services during resync: ${err}`);
+                    return;
+                }
+                parseStates(states, services, callback);
+            });
+        });
+    }, 3000);
+}
 
 function startAdapter(options) {
     options = options || {};
@@ -27,10 +191,6 @@ function startAdapter(options) {
             if (!connected) {
                 return adapter.log.warn(`Cannot send command to "${id}", because not connected`);
             }
-            /*if (id === adapter.namespace + '.' + '.info.resync') {
-                queue.push({command: 'resync'});
-                processQueue();
-            } else */
             if (hassObjects[id]) {
                 if (!hassObjects[id].common.write) {
                     adapter.log.warn(`Object ${id} is not writable!`);
@@ -38,6 +198,35 @@ function startAdapter(options) {
                     const serviceData = {};
                     const fields = hassObjects[id].native.fields;
                     const target = {};
+
+                    // Special handling for boolean "switch" friendly states
+                    if (id.endsWith('.state_boolean')) {
+                        adapter.log.debug(`Object native properties: ${safeStringify(hassObjects[id].native)}`);
+                        
+                        const entityId = hassObjects[id].native && hassObjects[id].native.entity_id;
+                        const domain = entityId ? entityId.split('.')[0] : (hassObjects[id].native && (hassObjects[id].native.domain || hassObjects[id].native.type));
+                        const service = state.val ? 'turn_on' : 'turn_off';
+                        
+                        adapter.log.debug(`Processing boolean state change for ${id}`);
+                        adapter.log.silly(`Domain: ${domain}, Entity: ${entityId}, Service: ${service}, Value: ${state.val}`);
+                        
+                        if (domain && typeof hass.callService === 'function' && entityId) {
+                            const sd = { entity_id: entityId };
+                            adapter.log.debug(`Calling HASS with service: ${service}, domain: ${domain}, serviceData: ${safeStringify(sd)}`);
+                            
+                            hass.callService(service, domain, sd, {}, err => {
+                                if (err) {
+                                    adapter.log.error(`Cannot control ${id}: ${err}`);
+                                    adapter.log.debug(`Failed service call details - Service: ${service}, Domain: ${domain}, ServiceData: ${safeStringify(sd)}`);
+                                } else {
+                                    adapter.log.debug(`Successfully sent command to HASS for ${id}`);
+                                }
+                            });
+                            return;
+                        } else {
+                            adapter.log.warn(`No domain/entity found or hass.callService missing for ${id}`);
+                        }
+                    }
 
                     let requestFields = {};
                     if (typeof state.val === 'string') {
@@ -57,36 +246,63 @@ function startAdapter(options) {
                         const fieldList = Object.keys(fields);
                         if (fieldList.length === 1 && fieldList[0] !== 'entity_id') {
                             requestFields[fieldList[0]] = state.val;
-                        } else if (fieldList.length === 2 && fields.entity_id) {
-                            requestFields[fieldList[1 - fields.indexOf('entity_id')]] = state.val;
+                        } else if (fieldList.length === 2 && fieldList.indexOf('entity_id') !== -1) {
+                            const idx = fieldList.indexOf('entity_id');
+                            const otherIdx = 1 - idx;
+                            requestFields[fieldList[otherIdx]] = state.val;
                         }
                     }
 
-                    adapter.log.debug(`Prepare service call for ${id} with (mapped) request parameters ${JSON.stringify(requestFields)} from value: ${JSON.stringify(state.val)}`);
+                    adapter.log.debug(`Prepare service call for ${id} with (mapped) request parameters ${safeStringify(requestFields)} from value: ${safeStringify(state.val)}`);
                     if (fields) {
                         for (const field in fields) {
-                            if (!fields.hasOwnProperty(field)) {
+                            if (!Object.prototype.hasOwnProperty.call(fields, field)) {
                                 continue;
                             }
 
                             if (field === 'entity_id') {
-                                target.entity_id = hassObjects[id].native.entity_id
+                                // keep target for some services that accept a target parameter
+                                if (hassObjects[id].native && hassObjects[id].native.entity_id) {
+                                    target.entity_id = hassObjects[id].native.entity_id;
+                                }
                             } else if (requestFields[field] !== undefined) {
                                 serviceData[field] = requestFields[field];
                             }
                         }
                     }
                     const noFields = Object.keys(serviceData).length === 0;
-                    serviceData.entity_id = hassObjects[id].native.entity_id
 
-                    adapter.log.debug(`Send to HASS for service ${hassObjects[id].native.attr} with ${hassObjects[id].native.domain || hassObjects[id].native.type} and data ${JSON.stringify(serviceData)}`)
-                    hass.callService(hassObjects[id].native.attr, hassObjects[id].native.domain || hassObjects[id].native.type, serviceData, target, err => {
-                        err && adapter.log.error(`Cannot control ${id}: ${err}`);
-                        if (err && fields && noFields) {
-                            adapter.log.warn(`Please make sure to provide a stringified JSON as value to set relevant fields! Please refer to the Readme for details!`);
-                            adapter.log.warn(`Allowed field keys are: ${Object.keys(fields).join(', ')}`);
+                    // ensure entity_id in service data if required by service
+                    if (!serviceData.entity_id && hassObjects[id].native && hassObjects[id].native.entity_id) {
+                        serviceData.entity_id = hassObjects[id].native.entity_id;
+                    }
+
+                    // Make sure hass.callService exists
+                    try {
+                        adapter.log.debug(`Send to HASS for service ${hassObjects[id].native && hassObjects[id].native.attr} with ${hassObjects[id].native && (hassObjects[id].native.domain || hassObjects[id].native.type)} and data ${safeStringify(serviceData)}`);
+                        if (typeof hass.callService !== 'function') {
+                            throw new Error('hass.callService is not a function');
                         }
-                    });
+                        hass.callService(
+                            hassObjects[id].native.attr,
+                            hassObjects[id].native.domain || hassObjects[id].native.type,
+                            serviceData,
+                            target,
+                            err => {
+                                if (err) {
+                                    adapter.log.error(`Cannot control ${id}: ${err}`);
+                                    if (err && fields && noFields) {
+                                        adapter.log.warn(`Please make sure to provide a stringified JSON as value to set relevant fields! Please refer to the Readme for details!`);
+                                        adapter.log.warn(`Allowed field keys are: ${Object.keys(fields).join(', ')}`);
+                                    }
+                                } else {
+                                    adapter.log.debug(`Service call for ${id} successful`);
+                                }
+                            }
+                        );
+                    } catch (e) {
+                        adapter.log.error(`Error calling hass.callService for ${id}: ${e && e.message ? e.message : e}`);
+                    }
                 }
             }
         }
@@ -102,7 +318,8 @@ function startAdapter(options) {
 function stop(callback) {
     stopped = true;
     delayTimeout && clearTimeout(delayTimeout);
-    hass && hass.close();
+    syncDebounceTimeout && clearTimeout(syncDebounceTimeout);
+    hass && typeof hass.close === 'function' && hass.close();
     callback && callback();
 }
 
@@ -124,7 +341,7 @@ function getUnit(name) {
 
 function syncStates(states, cb) {
     if (!states || !states.length) {
-        return cb();
+        return cb && cb();
     }
     const state = states.shift();
     const id = state.id;
@@ -136,39 +353,79 @@ function syncStates(states, cb) {
     });
 }
 
-function syncObjects(objects, cb) {
+function syncObjects(objects, stats, cb) {
     if (!objects || !objects.length) {
-        return cb();
+        return cb && cb();
     }
-    const obj = objects.shift();
-    hassObjects[obj._id] = obj;
 
-    adapter.getForeignObject(obj._id, (err, oldObj) => {
-
-        err && adapter.log.error(err);
-
-        if (!oldObj) {
-            adapter.log.debug(`Create "${obj._id}": ${JSON.stringify(obj.common)}`);
-            hassObjects[obj._id] = obj;
-            adapter.setForeignObject(obj._id, obj, err => {
-                err && adapter.log.error(err);
-                setImmediate(syncObjects, objects, cb);
-            });
-        } else {
-            hassObjects[obj._id] = oldObj;
-            if (JSON.stringify(obj.native) !== JSON.stringify(oldObj.native)) {
-                oldObj.native = obj.native;
-
-                adapter.log.debug(`Update "${obj._id}": ${JSON.stringify(obj.common)}`);
-                adapter.setForeignObject(obj._id, oldObj, err => {
-                    err => adapter.log.error(err);
-                    setImmediate(syncObjects, objects, cb);
-                });
+    const groupedObjects = {};
+    // Group objects by entity
+    objects.forEach(obj => {
+        const parts = obj._id.split('.');
+        const entityIndex = parts.indexOf('entities') + 1;
+        if (entityIndex > 0 && entityIndex + 1 < parts.length) {
+            const entityId = parts[entityIndex] + '.' + parts[entityIndex + 1];
+            const fullEntityPath = `${adapter.namespace}.entities.${entityId}`;
+            if (!groupedObjects[fullEntityPath]) {
+                groupedObjects[fullEntityPath] = {
+                    new: [],
+                    updated: []
+                };
+            }
+            if (!hassObjects[obj._id]) {
+                groupedObjects[fullEntityPath].new.push(obj);
+                stats && typeof stats.new === 'number' && (stats.new++);
             } else {
-                setImmediate(syncObjects, objects, cb);
+                groupedObjects[fullEntityPath].updated.push(obj);
             }
         }
     });
+
+    const entityIds = Object.keys(groupedObjects);
+
+    function processEntity() {
+        if (!entityIds.length) {
+            return cb && cb();
+        }
+        const entityId = entityIds.shift();
+        const entityObjects = groupedObjects[entityId];
+
+        function processNext() {
+            if (!entityObjects.new.length && !entityObjects.updated.length) {
+                setImmediate(processEntity);
+                return;
+            }
+
+            const obj = entityObjects.new.length ? entityObjects.new.shift() : entityObjects.updated.shift();
+            adapter.getForeignObject(obj._id, (err, oldObj) => {
+                err && adapter.log.error(err);
+
+                if (!oldObj) {
+                    adapter.log.debug(`Create "${obj._id}": ${safeStringify(obj.common)}`);
+                    hassObjects[obj._id] = obj;
+                    adapter.setForeignObject(obj._id, obj, err => {
+                        err && adapter.log.error(err);
+                        setImmediate(processNext);
+                    });
+                } else {
+                    hassObjects[obj._id] = oldObj;
+                    if (safeStringify(obj.native) !== safeStringify(oldObj.native)) {
+                        oldObj.native = obj.native;
+                        adapter.log.debug(`Update "${obj._id}": ${safeStringify(obj.common)}`);
+                        adapter.setForeignObject(obj._id, oldObj, err => {
+                            err && adapter.log.error(err);
+                            stats && typeof stats.updated === 'number' && (stats.updated++); // Count updates
+                            setImmediate(processNext);
+                        });
+                    } else {
+                        setImmediate(processNext);
+                    }
+                }
+            });
+        }
+        processNext();
+    }
+    processEntity();
 }
 
 function syncRoom(room, members, cb) {
@@ -186,7 +443,7 @@ function syncRoom(room, members, cb) {
             adapter.log.debug(`Update "${obj._id}"`);
             adapter.setForeignObject(obj._id, obj, err => {
                 err && adapter.log.error(err);
-                cb();
+                cb && cb();
             });
         } else {
             obj.common = obj.common || {};
@@ -202,10 +459,10 @@ function syncRoom(room, members, cb) {
                 adapter.log.debug(`Update "${obj._id}"`);
                 adapter.setForeignObject(obj._id, obj, err => {
                     err && adapter.log.error(err);
-                    cb();
+                    cb && cb();
                 });
             } else {
-                cb();
+                cb && cb();
             }
         }
     });
@@ -233,21 +490,28 @@ const skipServices = [
 ];
 
 function parseStates(entities, services, callback) {
-    const objs   = [];
+    const objs = [];
     const states = [];
+    const newHassObjects = {};
     let obj;
     let channel;
+    const expectedObjects = new Set();
+
     for (let e = 0; e < entities.length; e++) {
         const entity = entities[e];
         if (!entity) continue;
 
         const name = entity.name || (entity.attributes && entity.attributes.friendly_name ? entity.attributes.friendly_name : entity.entity_id);
-        const desc = entity.attributes && entity.attributes.attribution   ? entity.attributes.attribution   : undefined;
+        const desc = entity.attributes && entity.attributes.attribution ? entity.attributes.attribution : undefined;
 
+        const channelId = `${adapter.namespace}.entities.${entity.entity_id}`;
+        expectedObjects.add(channelId);
+        
         channel = {
-            _id: `${adapter.namespace}.entities.${entity.entity_id}`,
+            _id: channelId,
             common: {
-                name: name
+                name: name,
+                role: 'channel'
             },
             type: 'channel',
             native: {
@@ -262,85 +526,130 @@ function parseStates(entities, services, callback) {
         const ts = entity.last_updated ? new Date(entity.last_updated).getTime() : undefined;
 
         if (entity.state !== undefined) {
+            const stateId = `${channelId}.state`;
+            expectedObjects.add(stateId);
+
             obj = {
-                _id: `${adapter.namespace}.entities.${entity.entity_id}.state`,
+                _id: stateId,
                 type: 'state',
                 common: {
                     name: `${name} STATE`,
                     type: typeof entity.state,
                     read: true,
-                    write: false
+                    write: false,
+                    role: getRoleForState(entity)
                 },
                 native: {
-                    object_id:  entity.object_id,
-                    domain:     entity.domain,
-                    entity_id:  entity.entity_id
+                    object_id: entity.object_id,
+                    domain: entity.domain,
+                    entity_id: entity.entity_id
                 }
             };
+
+            const boolStateId = `${channelId}.state_boolean`;
+            expectedObjects.add(boolStateId);
+
+            if (!objs.find(o => o._id === boolStateId)) {
+                const booleanObj = {
+                    _id: boolStateId,
+                    type: 'state',
+                    common: {
+                        name: `${name} STATE_BOOLEAN`,
+                        type: 'boolean',
+                        read: true,
+                        write: true,
+                        role: 'switch'
+                    },
+                    native: {
+                        object_id: entity.object_id,
+                        domain: entity.domain,
+                        entity_id: entity.entity_id,
+                        attr: 'state',
+                        type: entity.domain
+                    }
+                };
+                objs.push(booleanObj);
+                states.push({
+                    id: boolStateId,
+                    lc: lc || Date.now(),
+                    ts: ts || Date.now(),
+                    val: entity.state === 'on',
+                    ack: true
+                });
+            }
+
             if (entity.attributes && entity.attributes.unit_of_measurement) {
                 obj.common.unit = entity.attributes.unit_of_measurement;
             }
-            adapter.log.debug(`Found Entity state ${obj._id}: ${JSON.stringify(obj.common)} / ${JSON.stringify(obj.native)}`)
             objs.push(obj);
 
             let val = entity.state;
             if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
-                val = JSON.stringify(val);
+                try {
+                    val = JSON.stringify(val);
+                } catch (e) {
+                    val = String(val);
+                }
             }
-
-            states.push({id: obj._id, lc, ts, val, ack: true})
+            states.push({id: obj._id, lc, ts, val, ack: true});
         }
 
         if (entity.attributes) {
             for (const attr in entity.attributes) {
-                if (entity.attributes.hasOwnProperty(attr)) {
-                    if (attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon') {
-                        continue;
-                    }
-
-                    let common;
-                    if (knownAttributes[attr]) {
-                        common = Object.assign({}, knownAttributes[attr]);
-                    } else {
-                        common = {};
-                    }
-
-                    const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
-                    obj = {
-                        _id: `${adapter.namespace}.entities.${entity.entity_id}.${attrId}`,
-                        type: 'state',
-                        common: common,
-                        native: {
-                            object_id:  entity.object_id,
-                            domain:     entity.domain,
-                            entity_id:  entity.entity_id,
-                            attr:       attr
-                        }
-                    };
-                    if (!common.name) {
-                        common.name = `${name} ${attr.replace(/_/g, ' ')}`;
-                    }
-                    if (common.read === undefined) {
-                        common.read = true;
-                    }
-                    if (common.write === undefined) {
-                        common.write = false;
-                    }
-                    if (common.type === undefined) {
-                        common.type = mapTypes[typeof entity.attributes[attr]];
-                    }
-
-                    adapter.log.debug(`Found Entity attribute ${obj._id}: ${JSON.stringify(obj.common)} / ${JSON.stringify(obj.native)}`)
-
-                    objs.push(obj);
-
-                    let val = entity.attributes[attr];
-                    if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
-                        val = JSON.stringify(val);
-                    }
-
-                    states.push({id: obj._id, lc, ts, val, ack: true});
+                if (!Object.prototype.hasOwnProperty.call(entity.attributes, attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon' || !attr.length) {
+                    continue;
                 }
+
+                const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
+                const fullAttrId = `${channelId}.${attrId}`;
+                expectedObjects.add(fullAttrId);
+
+                let common;
+                if (knownAttributes[attr]) {
+                    common = Object.assign({}, knownAttributes[attr]);
+                } else {
+                    common = {};
+                }
+
+                obj = {
+                    _id: fullAttrId,
+                    type: 'state',
+                    common: common,
+                    native: {
+                        object_id: entity.object_id,
+                        domain: entity.domain,
+                        entity_id: entity.entity_id,
+                        attr: attr
+                    }
+                };
+                if (!common.name) {
+                    common.name = `${name} ${attr.replace(/_/g, ' ')}`;
+                }
+                if (common.read === undefined) {
+                    common.read = true;
+                }
+                if (common.write === undefined) {
+                    common.write = false;
+                }
+                if (common.type === undefined) {
+                    common.type = mapTypes[typeof entity.attributes[attr]];
+                }
+                if (common.role === undefined) {
+                    common.role = getRoleForAttribute(attr, entity.attributes[attr], common.type);
+                }
+
+                objs.push(obj);
+
+                let val = entity.attributes[attr];
+                if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
+                    try {
+                        val = JSON.stringify(val);
+                    } catch (e) {
+                        val = String(val);
+                    }
+                }
+
+                states.push({id: obj._id, lc, ts, val, ack: true});
             }
         }
 
@@ -349,36 +658,116 @@ function parseStates(entities, services, callback) {
         if (services[serviceType] && !skipServices.includes(serviceType)) {
             const service = services[serviceType];
             for (const s in service) {
-                if (service.hasOwnProperty(s)) {
+                if (Object.prototype.hasOwnProperty.call(service, s)) {
+                    const serviceId = `${channelId}.${s}`;
+                    expectedObjects.add(serviceId);
+                    
                     obj = {
-                        _id: `${adapter.namespace}.entities.${entity.entity_id}.${s}`,
+                        _id: serviceId,
                         type: 'state',
                         common: {
                             desc: service[s].description,
                             read: false,
                             write: true,
-                            type: 'mixed'
+                            type: 'mixed',
+                            role: 'button'
                         },
                         native: {
-                            object_id:  entity.object_id,
-                            domain:     entity.domain,
-                            fields:     service[s].fields,
-                            entity_id:  entity.entity_id,
-                            attr:       s,
-                            type:       serviceType
+                            object_id: entity.object_id,
+                            domain: entity.domain,
+                            fields: service[s].fields,
+                            entity_id: entity.entity_id,
+                            attr: s,
+                            type: serviceType
                         }
                     };
-
-                    adapter.log.debug(`Found Entity service ${obj._id}: ${JSON.stringify(obj.common)} / ${JSON.stringify(obj.native)}`)
-
                     objs.push(obj);
                 }
             }
         }
     }
 
-    syncObjects(objs, () =>
-        syncStates(states, callback));
+    const objectsToDelete = [];
+    for (const id in hassObjects) {
+        if (Object.prototype.hasOwnProperty.call(hassObjects, id) && id.startsWith(`${adapter.namespace}.entities.`)) {
+            if (!expectedObjects.has(id)) {
+                objectsToDelete.push(id);
+            }
+        }
+    }
+
+    function deleteObjects(objects, cb) {
+        if (!objects.length) {
+            return cb && cb();
+        }
+
+        const groupedObjects = {};
+        objects.forEach(id => {
+            const parts = id.split('.');
+            const entityIndex = parts.indexOf('entities') + 1;
+            if (entityIndex > 0 && entityIndex + 1 < parts.length) {
+                const entityId = parts[entityIndex] + '.' + parts[entityIndex + 1];
+                const fullEntityPath = `${adapter.namespace}.entities.${entityId}`;
+                if (!groupedObjects[fullEntityPath]) {
+                    groupedObjects[fullEntityPath] = [];
+                }
+                groupedObjects[fullEntityPath].push(id);
+            }
+        });
+
+        const entityIds = Object.keys(groupedObjects);
+        
+        function deleteEntity() {
+            if (!entityIds.length) {
+                return cb && cb();
+            }
+            const entityId = entityIds.shift();
+            const objectsToDelete = groupedObjects[entityId];
+            
+            let deleted = 0;
+            function deleteNext() {
+                if (!objectsToDelete.length) {
+                    // nothing to delete for this entity -> continue
+                    setImmediate(deleteEntity);
+                    return;
+                }
+                const id = objectsToDelete.shift();
+                adapter.delObject(id, err => {
+                    if (err) {
+                        adapter.log.error(`Error deleting object ${id}: ${err}`);
+                    } else {
+                        deleted++;
+                        delete hassObjects[id];
+                    }
+                    setImmediate(deleteNext);
+                });
+            }
+            deleteNext();
+        }
+        deleteEntity();
+    }
+
+    const stats = {
+        new: 0,
+        updated: 0,
+        deleted: objectsToDelete.length
+    };
+
+    deleteObjects(objectsToDelete, () => {
+        syncObjects(objs, stats, () => {
+            if (stats.new > 0 || stats.deleted > 0) {
+                const changes = [];
+                if (stats.new > 0) changes.push(`${stats.new} created`);
+                if (stats.deleted > 0) changes.push(`${stats.deleted} deleted`);
+                adapter.log.info(`Synchronization completed: ${changes.join(', ')}`);
+            } else if (stats.updated > 0) {
+                adapter.log.debug(`Synchronization completed: ${stats.updated} updated`);
+            }
+            syncStates(states, () => {
+                callback && callback();
+            });
+        });
+    });
 }
 
 function main() {
@@ -393,7 +782,7 @@ function main() {
         adapter.log.error(err));
 
     hass.on('state_changed', entity => {
-        adapter.log.debug(`HASS-Message: State Changed: ${JSON.stringify(entity)}`);
+        adapter.log.debug(`HASS-Message: State Changed: ${safeStringify(entity)}`);
         if (!entity || typeof entity.entity_id !== 'string') {
             return;
         }
@@ -405,23 +794,38 @@ function main() {
             if (hassObjects[`${adapter.namespace}.${id}state`]) {
                 adapter.setState(`${id}state`, {val: entity.state, ack: true, lc: lc, ts: ts});
             } else {
-                adapter.log.info(`State changed for unknown object ${`${id}state`}. Please restart the adapter to resync the objects.`);
+                adapter.log.info(`State changed for unknown object ${`${id}state`}. Triggering synchronization to resync the objects.`);
+                debouncedSync();
+            }
+            if (hassObjects[`${adapter.namespace}.${id}state_boolean`]) {
+                adapter.setState(`${id}state_boolean`, {
+                    val: entity.state === 'on',
+                    ack: true,
+                    lc: lc || Date.now(),
+                    ts: ts || Date.now()
+                });
             }
         }
+        
         if (entity.attributes) {
             for (const attr in entity.attributes) {
-                if (!entity.attributes.hasOwnProperty(attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon'|| !attr.length) {
+                if (!Object.prototype.hasOwnProperty.call(entity.attributes, attr) || attr === 'friendly_name' || attr === 'unit_of_measurement' || attr === 'icon'|| !attr.length) {
                     continue;
                 }
                 let val = entity.attributes[attr];
                 if ((typeof val === 'object' && val !== null) || Array.isArray(val)) {
-                    val = JSON.stringify(val);
+                    try {
+                        val = JSON.stringify(val);
+                    } catch (e) {
+                        val = String(val);
+                    }
                 }
                 const attrId = attr.replace(adapter.FORBIDDEN_CHARS, '_').replace(/\.+$/, '_');
                 if (hassObjects[`${adapter.namespace}.${id}state`]) {
                     adapter.setState(id + attrId, {val, ack: true, lc, ts});
                 } else {
-                    adapter.log.info(`State changed for unknown object ${id + attrId}. Please restart the adapter to resync the objects.`);
+                    adapter.log.info(`State changed for unknown object ${id + attrId}. Triggering synchronization to resync the objects.`);
+                    debouncedSync();
                 }
             }
         }
@@ -437,7 +841,6 @@ function main() {
                     adapter.log.error(`Cannot read config: ${err}`);
                     return;
                 }
-                //adapter.log.debug(JSON.stringify(config));
                 delayTimeout = setTimeout(() => {
                     delayTimeout = null;
                     !stopped && hass.getStates((err, states) => {
@@ -447,7 +850,6 @@ function main() {
                         if (err) {
                             return adapter.log.error(`Cannot read states: ${err}`);
                         }
-                        //adapter.log.debug(JSON.stringify(states));
                         delayTimeout = setTimeout(() => {
                             delayTimeout = null;
                             !stopped && hass.getServices((err, services) => {
@@ -457,9 +859,8 @@ function main() {
                                 if (err) {
                                     adapter.log.error(`Cannot read states: ${err}`);
                                 } else {
-                                    //adapter.log.debug(JSON.stringify(services));
                                     parseStates(states, services, () => {
-                                        adapter.log.debug('Initial parsing of states done, subscribe to ioBroker states');
+                                        adapter.log.info('Initialization completed');
                                         adapter.subscribeStates('*');
                                     });
                                 }
